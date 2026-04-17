@@ -13,14 +13,19 @@ extension URL {
         URL.temporaryDirectory.appending(component: UUID().uuidString).appendingPathExtension(for: .quickTimeMovie)
     }
 
+    /// The preferred folder for local video recordings visible in Finder and Files (On My iPhone).
+    static var localVideosDirectoryURL: URL {
+        let fileManager = FileManager.default
+        let baseURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL.temporaryDirectory
+        return baseURL.appendingPathComponent("Videos", isDirectory: true)
+    }
+
     /// A unique output location for persisted local video recordings.
     static var localVideoRecordingFileURL: URL {
         let fileManager = FileManager.default
-        let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL.temporaryDirectory
-
-        let videosURL = baseURL.appendingPathComponent("Videos", isDirectory: true)
+        let videosURL = localVideosDirectoryURL
         try? fileManager.createDirectory(at: videosURL, withIntermediateDirectories: true)
 
         let formatter = DateFormatter()

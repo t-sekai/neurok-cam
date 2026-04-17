@@ -58,6 +58,12 @@ actor CaptureService {
     // A Boolean value that indicates whether the actor finished its required configuration.
     private var isSetUp = false
 
+    private static let calibrationTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     // A Boolean that indicates whether the app expects the capture session to be running.
     private var shouldRunSession = false
     
@@ -378,8 +384,78 @@ actor CaptureService {
         return seconds
     }
 
+    private func finiteSeconds(from time: CMTime) -> Double? {
+        let seconds = CMTimeGetSeconds(time)
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        return seconds
+    }
+
     private func clamp<T: Comparable>(_ value: T, to range: ClosedRange<T>) -> T {
         min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    private func cameraPositionDescription(_ position: AVCaptureDevice.Position) -> String {
+        switch position {
+        case .unspecified:
+            return "unspecified"
+        case .back:
+            return "back"
+        case .front:
+            return "front"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func serializedCalibrationPayload(_ payload: [String: Any]) -> Data {
+        let options: JSONSerialization.WritingOptions = [.prettyPrinted, .sortedKeys]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: options) else {
+            let fallback = #"{"available":false,"reason":"json_serialization_failed"}"#
+            return Data(fallback.utf8)
+        }
+        return data
+    }
+
+    private func jsonSafeValue(from value: Any) -> Any? {
+        if let string = value as? String {
+            return string
+        }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                return number.boolValue
+            }
+            let numberValue = number.doubleValue
+            guard numberValue.isFinite else { return nil }
+            return number
+        }
+        if let data = value as? Data {
+            return [
+                "type": "Data",
+                "byteCount": data.count,
+                "base64": data.base64EncodedString()
+            ]
+        }
+        if let array = value as? [Any] {
+            return array.compactMap { jsonSafeValue(from: $0) }
+        }
+        if let dictionary = value as? [AnyHashable: Any] {
+            var mapped = [String: Any]()
+            for (key, nestedValue) in dictionary {
+                let keyString = String(describing: key)
+                if let jsonValue = jsonSafeValue(from: nestedValue) {
+                    mapped[keyString] = jsonValue
+                }
+            }
+            return mapped
+        }
+        if let date = value as? Date {
+            return Self.calibrationTimestampFormatter.string(from: date)
+        }
+        if let url = value as? URL {
+            return url.absoluteString
+        }
+        return String(describing: value)
     }
     
     // MARK: - Capture controls
@@ -683,6 +759,117 @@ actor CaptureService {
     /// Stops the recording and returns the captured movie.
     func stopRecording() async throws -> Movie {
         try await movieCapture.stopRecording()
+    }
+
+    /// Captures a JSON snapshot of camera calibration-related state at recording start.
+    func recordingCalibrationJSONData() -> Data {
+        var payload: [String: Any] = [
+            "schemaVersion": 1,
+            "capturedAt": Self.calibrationTimestampFormatter.string(from: Date()),
+            "source": "AVCaptureDevice.activeFormat"
+        ]
+
+        guard isSetUp, let device = activeVideoInput?.device else {
+            payload["available"] = false
+            payload["reason"] = "capture_service_not_ready"
+            return serializedCalibrationPayload(payload)
+        }
+
+        payload["available"] = true
+
+        let format = device.activeFormat
+        let formatDescription = format.formatDescription
+        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+
+        var devicePayload: [String: Any] = [
+            "localizedName": device.localizedName,
+            "uniqueID": device.uniqueID,
+            "modelID": device.modelID,
+            "deviceType": device.deviceType.rawValue,
+            "position": cameraPositionDescription(device.position),
+            "isGeometricDistortionCorrectionSupported": device.isGeometricDistortionCorrectionSupported,
+            "isGeometricDistortionCorrectionEnabled": device.isGeometricDistortionCorrectionEnabled,
+            "activeColorSpaceRawValue": device.activeColorSpace.rawValue
+        ]
+        if let exposureDurationSeconds = finiteSeconds(from: device.exposureDuration) {
+            devicePayload["exposureDurationSeconds"] = exposureDurationSeconds
+        }
+        payload["device"] = devicePayload
+
+        let frameRateRanges = format.videoSupportedFrameRateRanges.compactMap { range -> [String: Any]? in
+            guard range.minFrameRate.isFinite, range.maxFrameRate.isFinite else { return nil }
+            return [
+                "minFrameRate": range.minFrameRate,
+                "maxFrameRate": range.maxFrameRate
+            ]
+        }
+
+        var formatPayload: [String: Any] = [
+            "mediaType": format.mediaType.rawValue,
+            "dimensions": [
+                "width": Int(dimensions.width),
+                "height": Int(dimensions.height)
+            ],
+            "isVideoBinned": format.isVideoBinned,
+            "videoFieldOfViewDegrees": format.videoFieldOfView,
+            "geometricDistortionCorrectedVideoFieldOfViewDegrees": format.geometricDistortionCorrectedVideoFieldOfView,
+            "videoMaxZoomFactor": format.videoMaxZoomFactor,
+            "videoZoomFactorUpscaleThreshold": format.videoZoomFactorUpscaleThreshold,
+            "minISO": format.minISO,
+            "maxISO": format.maxISO,
+            "supportedFrameRateRanges": frameRateRanges
+        ]
+        if let minExposureDurationSeconds = finiteSeconds(from: format.minExposureDuration) {
+            formatPayload["minExposureDurationSeconds"] = minExposureDurationSeconds
+        }
+        if let maxExposureDurationSeconds = finiteSeconds(from: format.maxExposureDuration) {
+            formatPayload["maxExposureDurationSeconds"] = maxExposureDurationSeconds
+        }
+        payload["activeFormat"] = formatPayload
+
+        var captureStatePayload: [String: Any] = [
+            "videoZoomFactor": device.videoZoomFactor,
+            "iso": device.iso,
+            "lensPosition": device.lensPosition,
+            "exposureTargetBias": device.exposureTargetBias
+        ]
+        if let activeVideoMinFrameDurationSeconds = finiteSeconds(from: device.activeVideoMinFrameDuration) {
+            captureStatePayload["activeVideoMinFrameDurationSeconds"] = activeVideoMinFrameDurationSeconds
+        }
+        if let activeVideoMaxFrameDurationSeconds = finiteSeconds(from: device.activeVideoMaxFrameDuration) {
+            captureStatePayload["activeVideoMaxFrameDurationSeconds"] = activeVideoMaxFrameDurationSeconds
+        }
+        let whiteBalance = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+        if whiteBalance.temperature.isFinite {
+            captureStatePayload["whiteBalanceTemperature"] = whiteBalance.temperature
+        }
+        if whiteBalance.tint.isFinite {
+            captureStatePayload["whiteBalanceTint"] = whiteBalance.tint
+        }
+        payload["captureState"] = captureStatePayload
+
+        if let connection = movieCapture.output.connection(with: .video) {
+            var connectionPayload: [String: Any] = [
+                "isEnabled": connection.isEnabled,
+                "isActive": connection.isActive,
+                "isVideoStabilizationSupported": connection.isVideoStabilizationSupported,
+                "preferredVideoStabilizationModeRawValue": connection.preferredVideoStabilizationMode.rawValue,
+                "activeVideoStabilizationModeRawValue": connection.activeVideoStabilizationMode.rawValue,
+                "isCameraIntrinsicMatrixDeliverySupported": connection.isCameraIntrinsicMatrixDeliverySupported,
+                "isCameraIntrinsicMatrixDeliveryEnabled": connection.isCameraIntrinsicMatrixDeliveryEnabled
+            ]
+            if connection.videoRotationAngle.isFinite {
+                connectionPayload["videoRotationAngleDegrees"] = connection.videoRotationAngle
+            }
+            payload["videoConnection"] = connectionPayload
+        }
+
+        if let extensions = CMFormatDescriptionGetExtensions(formatDescription),
+           let sanitizedExtensions = jsonSafeValue(from: extensions) {
+            payload["formatDescriptionExtensions"] = sanitizedExtensions
+        }
+
+        return serializedCalibrationPayload(payload)
     }
     
     /// Sets whether the app captures HDR video.

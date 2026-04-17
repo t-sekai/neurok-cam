@@ -171,6 +171,9 @@ final class CameraModel: Camera {
     /// Tentacle timecode frozen at recording start for metadata.
     private var recordingStartTimecodeMetadata: RecordingStartTimecodeMetadata?
 
+    /// Calibration snapshot captured at recording start and persisted as sidecar JSON on stop.
+    private var pendingRecordingCalibrationJSON: Data?
+
     /// Ensures camera state observers are only attached once.
     private var hasAttachedStateObservers = false
     
@@ -819,10 +822,12 @@ final class CameraModel: Camera {
     func toggleRecording() async {
         switch await captureService.captureActivity {
         case .movieCapture:
+            let calibrationJSON = pendingRecordingCalibrationJSON
+            pendingRecordingCalibrationJSON = nil
             do {
                 // If currently recording, stop and persist the movie to local app storage.
                 let movie = try await captureService.stopRecording()
-                _ = try await localVideoStore.store(movie: movie)
+                _ = try await localVideoStore.store(movie: movie, calibrationJSON: calibrationJSON)
                 localVideoURLs = await localVideoStore.loadStoredVideos()
                 recordingStartTimecodeMetadata = nil
                 stopRecordingClock()
@@ -834,6 +839,7 @@ final class CameraModel: Camera {
             // In any other case, start recording.
             let recordingSeedTimecode = currentTentacleTimecode()
             recordingStartTimecodeMetadata = currentRecordingStartMetadata()
+            pendingRecordingCalibrationJSON = await captureService.recordingCalibrationJSONData()
             startRecordingClock(seedTimecode: recordingSeedTimecode)
             await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
         }
@@ -1431,13 +1437,13 @@ private actor LocalVideoStore {
         return restoredURLs
     }
 
-    func store(movie: Movie) async throws -> URL {
+    func store(movie: Movie, calibrationJSON: Data?) async throws -> URL {
         try await waitForMovieFileToExist(at: movie.url)
         let folderURL = try ensureVideosFolder()
         let sourceFolderURL = movie.url.deletingLastPathComponent()
 
         let destinationURL: URL
-        if sourceFolderURL.path == folderURL.path {
+        if isSameFileLocation(sourceFolderURL, folderURL) {
             destinationURL = movie.url
         } else {
             let relocatedURL = folderURL.appending(path: uniqueFileName(), directoryHint: .notDirectory)
@@ -1445,8 +1451,15 @@ private actor LocalVideoStore {
             destinationURL = relocatedURL
         }
 
+        if let calibrationJSON {
+            try writeCalibrationSidecar(calibrationJSON, forMovieURL: destinationURL)
+        }
+        markExcludedFromBackupIfPossible(destinationURL)
+        markExcludedFromBackupIfPossible(calibrationSidecarURL(forMovieURL: destinationURL))
+
         var urls = loadStoredVideos()
-        urls.removeAll { $0.path() == destinationURL.path() }
+        let destinationPath = canonicalPath(for: destinationURL)
+        urls.removeAll { canonicalPath(for: $0) == destinationPath }
         urls.insert(destinationURL, at: 0)
         persistVideoList(urls)
         return destinationURL
@@ -1457,23 +1470,23 @@ private actor LocalVideoStore {
             return loadStoredVideos()
         }
 
-        let pathsToDelete = Set(urls.map(\.path))
-        for url in urls where fileManager.fileExists(atPath: url.path) {
+        let pathsToDelete = Set(urls.map { canonicalPath(for: $0) })
+        for url in urls where fileManager.fileExists(atPath: canonicalPath(for: url)) {
             try? fileManager.removeItem(at: url)
+            let sidecarURL = calibrationSidecarURL(forMovieURL: url)
+            if fileManager.fileExists(atPath: sidecarURL.path) {
+                try? fileManager.removeItem(at: sidecarURL)
+            }
         }
 
         var remaining = loadStoredVideos()
-        remaining.removeAll { pathsToDelete.contains($0.path) }
+        remaining.removeAll { pathsToDelete.contains(canonicalPath(for: $0)) }
         persistVideoList(remaining)
         return remaining
     }
 
     private func ensureVideosFolder() throws -> URL {
-        let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-
-        let videosURL = baseURL.appendingPathComponent(Self.folderName, isDirectory: true)
+        let videosURL = preferredVideosFolderURL()
         if !fileManager.fileExists(atPath: videosURL.path) {
             do {
                 try fileManager.createDirectory(at: videosURL, withIntermediateDirectories: true)
@@ -1481,7 +1494,73 @@ private actor LocalVideoStore {
                 throw CocoaError(.fileWriteUnknown)
             }
         }
+
+        markExcludedFromBackupIfPossible(videosURL)
+        migrateLegacyVideosIfNeeded(to: videosURL)
         return videosURL
+    }
+
+    private func preferredVideosFolderURL() -> URL {
+        if let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first {
+            return documentsURL.appendingPathComponent(Self.folderName, isDirectory: true)
+        }
+        if let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            return appSupportURL.appendingPathComponent(Self.folderName, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(Self.folderName, isDirectory: true)
+    }
+
+    private func legacyVideosFolderURL(relativeTo preferredURL: URL) -> URL? {
+        guard let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let legacyURL = appSupportURL.appendingPathComponent(Self.folderName, isDirectory: true)
+        guard !isSameFileLocation(legacyURL, preferredURL) else {
+            return nil
+        }
+        return legacyURL
+    }
+
+    private func migrateLegacyVideosIfNeeded(to preferredURL: URL) {
+        guard let legacyURL = legacyVideosFolderURL(relativeTo: preferredURL),
+              fileManager.fileExists(atPath: legacyURL.path),
+              let contents = try? fileManager.contentsOfDirectory(at: legacyURL,
+                                                                  includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles]) else {
+            return
+        }
+
+        for sourceURL in contents where shouldMigrateFile(at: sourceURL) {
+            let destinationURL = preferredURL.appendingPathComponent(sourceURL.lastPathComponent, isDirectory: false)
+            if fileManager.fileExists(atPath: destinationURL.path) {
+                continue
+            }
+
+            do {
+                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+            } catch {
+                do {
+                    try fileManager.copyItem(at: sourceURL, to: destinationURL)
+                    try? fileManager.removeItem(at: sourceURL)
+                } catch {
+                    logger.error("Failed to migrate local video file \(sourceURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            markExcludedFromBackupIfPossible(destinationURL)
+        }
+
+        if let remaining = try? fileManager.contentsOfDirectory(at: legacyURL,
+                                                                includingPropertiesForKeys: nil,
+                                                                options: [.skipsHiddenFiles]),
+           remaining.isEmpty {
+            try? fileManager.removeItem(at: legacyURL)
+        }
+    }
+
+    private func shouldMigrateFile(at url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "mov" || ext == "mp4" || ext == "json"
     }
 
     private func uniqueFileName() -> String {
@@ -1490,6 +1569,25 @@ private actor LocalVideoStore {
         formatter.dateFormat = "yyyyMMdd_HHmmss_SSS"
         let timestamp = formatter.string(from: Date())
         return "video_\(timestamp)_\(UUID().uuidString.prefix(8)).mov"
+    }
+
+    private func calibrationSidecarURL(forMovieURL movieURL: URL) -> URL {
+        movieURL.deletingPathExtension().appendingPathExtension("json")
+    }
+
+    private func writeCalibrationSidecar(_ calibrationJSON: Data, forMovieURL movieURL: URL) throws {
+        let sidecarURL = calibrationSidecarURL(forMovieURL: movieURL)
+        if fileManager.fileExists(atPath: sidecarURL.path) {
+            try fileManager.removeItem(at: sidecarURL)
+        }
+        try calibrationJSON.write(to: sidecarURL, options: [.atomic])
+    }
+
+    private func markExcludedFromBackupIfPossible(_ url: URL) {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = url
+        try? mutableURL.setResourceValues(values)
     }
 
     private func listVideosInFolder(_ folderURL: URL) -> [URL] {
@@ -1520,12 +1618,20 @@ private actor LocalVideoStore {
         var unique = [URL]()
 
         for url in urls.sorted(by: isOrderedMostRecentFirst(_:_:)) {
-            let key = url.path()
+            let key = canonicalPath(for: url)
             if seen.insert(key).inserted {
                 unique.append(url)
             }
         }
         return unique
+    }
+
+    private func canonicalPath(for url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private func isSameFileLocation(_ lhs: URL, _ rhs: URL) -> Bool {
+        canonicalPath(for: lhs) == canonicalPath(for: rhs)
     }
 
     private func waitForMovieFileToExist(at url: URL) async throws {
