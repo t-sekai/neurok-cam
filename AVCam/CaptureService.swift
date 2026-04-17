@@ -36,14 +36,14 @@ actor CaptureService {
     // An object that manages the app's video capture behavior.
     private let movieCapture = MovieCapture()
     
-    // An internal collection of output services.
-    private var outputServices: [any OutputService] { [photoCapture, movieCapture] }
+    // An internal collection of active output services for this video-only build.
+    private var outputServices: [any OutputService] { [movieCapture] }
     
     // The video input for the currently selected device camera.
     private var activeVideoInput: AVCaptureDeviceInput?
     
-    // The mode of capture, either photo or video. Defaults to photo.
-    private(set) var captureMode = CaptureMode.photo
+    // The mode of capture, fixed to video for this app build.
+    private(set) var captureMode = CaptureMode.video
     
     // An object the service uses to retrieve capture devices.
     private let deviceLookup = DeviceLookup()
@@ -57,12 +57,18 @@ actor CaptureService {
     
     // A Boolean value that indicates whether the actor finished its required configuration.
     private var isSetUp = false
+
+    // A Boolean that indicates whether the app expects the capture session to be running.
+    private var shouldRunSession = false
     
     // A delegate object that responds to capture control activation and presentation events.
     private var controlsDelegate = CaptureControlsDelegate()
     
     // A map that stores capture controls by device identifier.
     private var controlsMap: [String: [AVCaptureControl]] = [:]
+
+    // The most recently applied manual control state.
+    private var manualControlState = ManualCameraControlState.default
     
     // A serial dispatch queue to use for capture control actions.
     private let sessionQueue = DispatchSerialQueue(label: "com.example.apple-samplecode.AVCam.sessionQueue")
@@ -98,14 +104,27 @@ actor CaptureService {
     // MARK: - Capture session life cycle
     func start(with state: CameraState) async throws {
         // Set initial operating state.
-        captureMode = state.captureMode
+        captureMode = .video
         isHDRVideoEnabled = state.isVideoHDREnabled
         
         // Exit early if not authorized or the session is already running.
         guard await isAuthorized, !captureSession.isRunning else { return }
         // Configure the session and start it.
         try setUpSession()
+        shouldRunSession = true
         captureSession.startRunning()
+    }
+
+    func stop() {
+        shouldRunSession = false
+
+        guard captureSession.isRunning else {
+            captureActivity = .idle
+            return
+        }
+
+        captureSession.stopRunning()
+        captureActivity = .idle
     }
     
     // MARK: - Capture setup
@@ -131,16 +150,10 @@ actor CaptureService {
             activeVideoInput = try addInput(for: defaultCamera)
             try addInput(for: defaultMic)
 
-            // Configure the session preset based on the current capture mode.
-            captureSession.sessionPreset = captureMode == .photo ? .photo : .high
-            // Add the photo capture output as the default output type.
-            try addOutput(photoCapture.output)
-            // If the capture mode is set to Video, add a movie capture output.
-            if captureMode == .video {
-                // Add the movie output as the default output type.
-                try addOutput(movieCapture.output)
-                setHDRVideoEnabled(isHDRVideoEnabled)
-            }
+            captureSession.sessionPreset = .high
+            // Add the movie output as the default output type.
+            try addOutput(movieCapture.output)
+            setHDRVideoEnabled(isHDRVideoEnabled)
             
             // Configure controls to use with the Camera Control.
             configureControls(for: defaultCamera)
@@ -186,6 +199,187 @@ actor CaptureService {
             fatalError("No device found for current video input.")
         }
         return device
+    }
+
+    // MARK: - Manual camera controls
+
+    func applyManualControlState(_ requestedState: ManualCameraControlState) -> ManualCameraControlSnapshot {
+        guard isSetUp else {
+            return ManualCameraControlSnapshot(state: requestedState, capabilities: .unavailable)
+        }
+
+        let device = currentDevice
+        let capabilities = manualControlCapabilities(for: device)
+        var resolvedState = clampedState(requestedState, capabilities: capabilities)
+
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+
+            applyFrameRateControl(&resolvedState, device: device, capabilities: capabilities)
+            applyExposureControl(&resolvedState, device: device, capabilities: capabilities)
+            applyWhiteBalanceControl(&resolvedState, device: device, capabilities: capabilities)
+            applyFocusControl(&resolvedState, device: device, capabilities: capabilities)
+        } catch {
+            logger.error("Unable to apply manual camera controls: \(error.localizedDescription, privacy: .public)")
+        }
+
+        manualControlState = resolvedState
+        return ManualCameraControlSnapshot(state: resolvedState, capabilities: capabilities)
+    }
+
+    private func applyFrameRateControl(_ state: inout ManualCameraControlState,
+                                       device: AVCaptureDevice,
+                                       capabilities: ManualCameraControlCapabilities) {
+        guard capabilities.supportsFrameRateControl else { return }
+
+        state.fps = clamp(state.fps, to: capabilities.fpsRange)
+        if state.isFPSLocked {
+            let targetDuration = CMTime(seconds: 1.0 / state.fps, preferredTimescale: 1_000_000_000)
+            device.activeVideoMinFrameDuration = targetDuration
+            device.activeVideoMaxFrameDuration = targetDuration
+        } else {
+            device.activeVideoMinFrameDuration = CMTime.invalid
+            device.activeVideoMaxFrameDuration = CMTime.invalid
+        }
+    }
+
+    private func applyExposureControl(_ state: inout ManualCameraControlState,
+                                      device: AVCaptureDevice,
+                                      capabilities: ManualCameraControlCapabilities) {
+        guard capabilities.supportsManualExposure else { return }
+
+        state.iso = clamp(state.iso, to: capabilities.isoRange)
+        state.shutterSeconds = clamp(state.shutterSeconds, to: capabilities.shutterRange)
+
+        if state.hasAnyExposureLock {
+            let currentShutter = safeSeconds(from: device.exposureDuration, fallback: state.shutterSeconds)
+            let targetShutter = state.isShutterLocked ? state.shutterSeconds : currentShutter
+            let targetDuration = CMTime(seconds: targetShutter, preferredTimescale: 1_000_000_000)
+            let targetISO = state.isISOLocked ? state.iso : device.iso
+            device.setExposureModeCustom(duration: targetDuration, iso: targetISO, completionHandler: nil)
+        } else if device.isExposureModeSupported(.continuousAutoExposure) {
+            device.exposureMode = .continuousAutoExposure
+        }
+    }
+
+    private func applyWhiteBalanceControl(_ state: inout ManualCameraControlState,
+                                          device: AVCaptureDevice,
+                                          capabilities: ManualCameraControlCapabilities) {
+        guard capabilities.supportsWhiteBalanceLock else { return }
+
+        state.whiteBalanceTemperature = clamp(state.whiteBalanceTemperature,
+                                              to: capabilities.whiteBalanceTemperatureRange)
+        state.tint = clamp(state.tint, to: capabilities.tintRange)
+
+        if state.hasAnyWhiteBalanceLock {
+            let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+            let targetTemperature = state.isWhiteBalanceLocked ? state.whiteBalanceTemperature : current.temperature
+            let targetTint = state.isTintLocked ? state.tint : current.tint
+            let targetValues = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: targetTemperature,
+                                                                                    tint: targetTint)
+            var gains = device.deviceWhiteBalanceGains(for: targetValues)
+            gains = normalizeWhiteBalanceGains(gains, device: device)
+            device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+
+            // Keep locked values aligned to the nearest representable gains on this sensor.
+            let resolved = device.temperatureAndTintValues(for: gains)
+            if state.isWhiteBalanceLocked {
+                state.whiteBalanceTemperature = clamp(resolved.temperature,
+                                                      to: capabilities.whiteBalanceTemperatureRange)
+            }
+            if state.isTintLocked {
+                state.tint = clamp(resolved.tint, to: capabilities.tintRange)
+            }
+        } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            device.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+    }
+
+    private func applyFocusControl(_ state: inout ManualCameraControlState,
+                                   device: AVCaptureDevice,
+                                   capabilities: ManualCameraControlCapabilities) {
+        guard capabilities.supportsFocusLock else { return }
+
+        state.focusLensPosition = clamp(state.focusLensPosition, to: capabilities.focusRange)
+        if state.isFocusLocked {
+            // Prevent subject-area callbacks from re-enabling autofocus while focus is locked.
+            device.isSubjectAreaChangeMonitoringEnabled = false
+            device.setFocusModeLocked(lensPosition: state.focusLensPosition, completionHandler: nil)
+        } else if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        }
+    }
+
+    private func manualControlCapabilities(for device: AVCaptureDevice) -> ManualCameraControlCapabilities {
+        let isoRange = device.activeFormat.minISO...device.activeFormat.maxISO
+        let shutterMin = safeSeconds(from: device.activeFormat.minExposureDuration, fallback: 1.0 / 2000.0)
+        let shutterMax = safeSeconds(from: device.activeFormat.maxExposureDuration, fallback: 0.25)
+        let shutterRange = min(shutterMin, shutterMax)...max(shutterMin, shutterMax)
+        let fpsRange = supportedFPSRange(for: device) ?? ManualCameraControlCapabilities.unavailable.fpsRange
+
+        return ManualCameraControlCapabilities(
+            isoRange: isoRange,
+            whiteBalanceTemperatureRange: 2000...10000,
+            fpsRange: fpsRange,
+            shutterRange: shutterRange,
+            tintRange: -150...150,
+            focusRange: 0...1,
+            supportsManualExposure: device.isExposureModeSupported(.custom),
+            supportsWhiteBalanceLock: device.isWhiteBalanceModeSupported(.locked),
+            supportsFrameRateControl: supportedFPSRange(for: device) != nil,
+            supportsFocusLock: device.isLockingFocusWithCustomLensPositionSupported
+        )
+    }
+
+    private func supportedFPSRange(for device: AVCaptureDevice) -> ClosedRange<Double>? {
+        let ranges = device.activeFormat.videoSupportedFrameRateRanges
+        guard let first = ranges.first else { return nil }
+
+        var minFPS = first.minFrameRate
+        var maxFPS = first.maxFrameRate
+        for range in ranges.dropFirst() {
+            minFPS = min(minFPS, range.minFrameRate)
+            maxFPS = max(maxFPS, range.maxFrameRate)
+        }
+
+        guard minFPS.isFinite, maxFPS.isFinite, minFPS > 0, maxFPS >= minFPS else {
+            return nil
+        }
+        return minFPS...maxFPS
+    }
+
+    private func clampedState(_ state: ManualCameraControlState,
+                              capabilities: ManualCameraControlCapabilities) -> ManualCameraControlState {
+        var clamped = state
+        clamped.iso = clamp(state.iso, to: capabilities.isoRange)
+        clamped.whiteBalanceTemperature = clamp(state.whiteBalanceTemperature,
+                                                to: capabilities.whiteBalanceTemperatureRange)
+        clamped.fps = clamp(state.fps, to: capabilities.fpsRange)
+        clamped.shutterSeconds = clamp(state.shutterSeconds, to: capabilities.shutterRange)
+        clamped.tint = clamp(state.tint, to: capabilities.tintRange)
+        clamped.focusLensPosition = clamp(state.focusLensPosition, to: capabilities.focusRange)
+        return clamped
+    }
+
+    private func normalizeWhiteBalanceGains(_ gains: AVCaptureDevice.WhiteBalanceGains,
+                                            device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
+        var normalized = gains
+        let maxGain = device.maxWhiteBalanceGain
+        normalized.redGain = clamp(normalized.redGain, to: 1...maxGain)
+        normalized.greenGain = clamp(normalized.greenGain, to: 1...maxGain)
+        normalized.blueGain = clamp(normalized.blueGain, to: 1...maxGain)
+        return normalized
+    }
+
+    private func safeSeconds(from time: CMTime, fallback: Double) -> Double {
+        let seconds = CMTimeGetSeconds(time)
+        guard seconds.isFinite, seconds > 0 else { return fallback }
+        return seconds
+    }
+
+    private func clamp<T: Comparable>(_ value: T, to range: ClosedRange<T>) -> T {
+        min(max(value, range.lowerBound), range.upperBound)
     }
     
     // MARK: - Capture controls
@@ -259,25 +453,19 @@ actor CaptureService {
     ///
     /// - Parameter `captureMode`: The capture mode to enable.
     func setCaptureMode(_ captureMode: CaptureMode) throws {
-        // Update the internal capture mode value before performing the session configuration.
-        self.captureMode = captureMode
+        guard captureMode == .video else { return }
+        self.captureMode = .video
         
         // Change the configuration atomically.
         captureSession.beginConfiguration()
         defer { captureSession.commitConfiguration() }
         
-        // Configure the capture session for the selected capture mode.
-        switch captureMode {
-        case .photo:
-            // The app needs to remove the movie capture output to perform Live Photo capture.
-            captureSession.sessionPreset = .photo
-            captureSession.removeOutput(movieCapture.output)
-        case .video:
-            captureSession.sessionPreset = .high
+        captureSession.sessionPreset = .high
+        if !captureSession.outputs.contains(where: { $0 === movieCapture.output }) {
             try addOutput(movieCapture.output)
-            if isHDRVideoEnabled {
-                setHDRVideoEnabled(true)
-            }
+        }
+        if isHDRVideoEnabled {
+            setHDRVideoEnabled(true)
         }
 
         // Update the advertised capabilities after reconfiguration.
@@ -418,12 +606,12 @@ actor CaptureService {
     /// Performs a one-time automatic focus and expose operation.
     ///
     /// The app calls this method as the result of a person tapping on the preview area.
-    func focusAndExpose(at point: CGPoint) {
+    func focusAndExpose(at point: CGPoint, adjustExposure: Bool = true) {
         // The point this call receives is in view-space coordinates. Convert this point to device coordinates.
         let devicePoint = videoPreviewLayer.captureDevicePointConverted(fromLayerPoint: point)
         do {
             // Perform a user-initiated focus and expose.
-            try focusAndExpose(at: devicePoint, isUserInitiated: true)
+            try focusAndExpose(at: devicePoint, isUserInitiated: true, adjustExposure: adjustExposure)
         } catch {
             logger.debug("Unable to perform focus and exposure operation. \(error)")
         }
@@ -436,6 +624,10 @@ actor CaptureService {
         subjectAreaChangeTask = Task {
             // Signal true when this notification occurs.
             for await _ in NotificationCenter.default.notifications(named: AVCaptureDevice.subjectAreaDidChangeNotification, object: device).compactMap({ _ in true }) {
+                // Keep a true manual focus lock fixed at the same distance.
+                if manualControlState.isFocusLocked {
+                    continue
+                }
                 // Perform a system-initiated focus and expose.
                 try? focusAndExpose(at: CGPoint(x: 0.5, y: 0.5), isUserInitiated: false)
             }
@@ -443,7 +635,11 @@ actor CaptureService {
     }
     private var subjectAreaChangeTask: Task<Void, Never>?
     
-    private func focusAndExpose(at devicePoint: CGPoint, isUserInitiated: Bool) throws {
+    private func focusAndExpose(at devicePoint: CGPoint, isUserInitiated: Bool, adjustExposure: Bool = true) throws {
+        if manualControlState.isFocusLocked {
+            return
+        }
+
         // Configure the current device.
         let device = currentDevice
         
@@ -456,15 +652,17 @@ actor CaptureService {
             device.focusMode = focusMode
         }
         
-        let exposureMode = isUserInitiated ? AVCaptureDevice.ExposureMode.autoExpose : .continuousAutoExposure
-        if device.isExposurePointOfInterestSupported && device.isExposureModeSupported(exposureMode) {
-            device.exposurePointOfInterest = devicePoint
-            device.exposureMode = exposureMode
+        if adjustExposure {
+            let exposureMode = isUserInitiated ? AVCaptureDevice.ExposureMode.autoExpose : .continuousAutoExposure
+            if device.isExposurePointOfInterestSupported && device.isExposureModeSupported(exposureMode) {
+                device.exposurePointOfInterest = devicePoint
+                device.exposureMode = exposureMode
+            }
         }
         // Enable subject-area change monitoring when performing a user-initiated automatic focus and exposure operation.
         // If this method enables change monitoring, when the device's subject area changes, the app calls this method a
         // second time and resets the device to continuous automatic focus and exposure.
-        device.isSubjectAreaChangeMonitoringEnabled = isUserInitiated
+        device.isSubjectAreaChangeMonitoringEnabled = isUserInitiated && adjustExposure
         
         // Release the lock.
         device.unlockForConfiguration()
@@ -478,8 +676,8 @@ actor CaptureService {
     // MARK: - Movie capture
     /// Starts recording video. The video records until the user stops recording,
     /// which calls the following `stopRecording()` method.
-    func startRecording() {
-        movieCapture.startRecording()
+    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) {
+        movieCapture.startRecording(recordingStartMetadata: recordingStartMetadata)
     }
     
     /// Stops the recording and returns the captured movie.
@@ -518,18 +716,13 @@ actor CaptureService {
         // Update the output service configuration.
         outputServices.forEach { $0.updateConfiguration(for: currentDevice) }
         // Set the capture service's capabilities for the selected mode.
-        switch captureMode {
-        case .photo:
-            captureCapabilities = photoCapture.capabilities
-        case .video:
-            captureCapabilities = movieCapture.capabilities
-        }
+        captureCapabilities = movieCapture.capabilities
     }
     
     /// Merge the `captureActivity` values of the photo and movie capture services,
     /// and assign the value to the actor's property.`
     private func observeOutputServices() {
-        Publishers.Merge(photoCapture.$captureActivity, movieCapture.$captureActivity)
+        movieCapture.$captureActivity
             .assign(to: &$captureActivity)
     }
     
@@ -562,7 +755,7 @@ actor CaptureService {
                 .compactMap({ $0.userInfo?[AVCaptureSessionErrorKey] as? AVError }) {
                 // If the system resets media services, the capture session stops running.
                 if error.code == .mediaServicesWereReset {
-                    if !captureSession.isRunning {
+                    if shouldRunSession, !captureSession.isRunning {
                         captureSession.startRunning()
                     }
                 }

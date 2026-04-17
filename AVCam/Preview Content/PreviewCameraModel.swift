@@ -17,6 +17,26 @@ class PreviewCameraModel: Camera {
     var shouldFlashScreen = false
     var isHDRVideoSupported = false
     var isHDRVideoEnabled = false
+    var tentacleConnectionState = TentacleConnectionState.connected("Tentacle Preview")
+    var tentacleTimecode = TentacleTimecode(payload: Data([30, 16, 21, 21, 3, 0x81, 0x21]))
+    var displayedTentacleTimecode = "16:21:21:00"
+    var displayedRecordingTimecode = "16:21:21.120"
+    var displayedTentacleFPS: Int? = 30
+    var directorWebSocketURL = "ws://192.168.1.10:8765"
+    var directorDeviceName = "Camera A"
+    var manualControlState = ManualCameraControlState.default
+    let manualControlCapabilities = ManualCameraControlCapabilities(
+        isoRange: 25...2000,
+        whiteBalanceTemperatureRange: 2000...10000,
+        fpsRange: 1...120,
+        shutterRange: 1.0 / 2000.0...0.25,
+        tintRange: -150...150,
+        focusRange: 0...1,
+        supportsManualExposure: true,
+        supportsWhiteBalanceLock: true,
+        supportsFrameRateControl: true,
+        supportsFocusLock: true
+    )
     
     struct PreviewSourceStub: PreviewSource {
         // Stubbed out for test purposes.
@@ -27,7 +47,7 @@ class PreviewCameraModel: Camera {
     
     private(set) var status = CameraStatus.unknown
     private(set) var captureActivity = CaptureActivity.idle
-    var captureMode = CaptureMode.photo {
+    var captureMode = CaptureMode.video {
         didSet {
             isSwitchingModes = true
             Task {
@@ -41,11 +61,12 @@ class PreviewCameraModel: Camera {
     private(set) var isVideoDeviceSwitchable = true
     private(set) var isSwitchingVideoDevices = false
     private(set) var thumbnail: CGImage?
+    var localVideoURLs: [URL] = []
     
     var error: Error?
     
-    init(captureMode: CaptureMode = .photo, status: CameraStatus = .unknown) {
-        self.captureMode = captureMode
+    init(status: CameraStatus = .unknown) {
+        self.captureMode = .video
         self.status = status
     }
     
@@ -53,6 +74,11 @@ class PreviewCameraModel: Camera {
         if status == .unknown {
             status = .running
         }
+    }
+
+    func stop() async {
+        status = .unknown
+        captureActivity = .idle
     }
     
     func switchVideoDevices() {
@@ -85,5 +111,17 @@ class PreviewCameraModel: Camera {
     
     func syncState() async {
         logger.debug("Syncing state isn't implemented in PreviewCamera.")
+    }
+
+    func refreshLocalVideos() async {
+        logger.debug("Refreshing local videos isn't implemented in PreviewCamera.")
+    }
+
+    func deleteLocalVideo(_ url: URL) async {
+        localVideoURLs.removeAll { $0.path() == url.path() }
+    }
+
+    func deleteLocalVideos(at offsets: IndexSet) async {
+        localVideoURLs.remove(atOffsets: offsets)
     }
 }

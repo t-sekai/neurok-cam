@@ -20,11 +20,41 @@ protocol Camera: AnyObject, SendableMetatype {
     /// The camera's current activity state, which can be photo capture, movie capture, or idle.
     var captureActivity: CaptureActivity { get }
 
+    /// The current BLE connection state for Tentacle timecode input.
+    var tentacleConnectionState: TentacleConnectionState { get }
+
+    /// The most recently received Tentacle timecode payload.
+    var tentacleTimecode: TentacleTimecode? { get }
+
+    /// The continuously advancing Tentacle timecode string for UI display.
+    var displayedTentacleTimecode: String { get }
+
+    /// The recording timer string (seeded from Tentacle at record start, then locally incremented).
+    var displayedRecordingTimecode: String { get }
+
+    /// The frame rate for the displayed Tentacle timecode.
+    var displayedTentacleFPS: Int? { get }
+
+    /// The WebSocket URL for the laptop director control plane.
+    var directorWebSocketURL: String { get set }
+
+    /// The user-defined device name exposed to remote director clients.
+    var directorDeviceName: String { get set }
+
+    /// The current values and lock states for manual camera controls.
+    var manualControlState: ManualCameraControlState { get set }
+
+    /// The current capabilities and numeric ranges for manual camera controls.
+    var manualControlCapabilities: ManualCameraControlCapabilities { get }
+
     /// The source of video content for a camera preview.
     var previewSource: PreviewSource { get }
     
     /// Starts the camera capture pipeline.
     func start() async
+
+    /// Stops the camera capture pipeline.
+    func stop() async
 
     /// The capture mode, which can be photo or video.
     var captureMode: CaptureMode { get set }
@@ -67,6 +97,18 @@ protocol Camera: AnyObject, SendableMetatype {
     
     /// A thumbnail image for the most recent photo or video capture.
     var thumbnail: CGImage? { get }
+
+    /// Locally stored video files in the app sandbox.
+    var localVideoURLs: [URL] { get }
+
+    /// Reloads locally stored videos from disk.
+    func refreshLocalVideos() async
+
+    /// Deletes a single locally stored video file.
+    func deleteLocalVideo(_ url: URL) async
+
+    /// Deletes locally stored videos at the given offsets.
+    func deleteLocalVideos(at offsets: IndexSet) async
     
     /// An error if the camera encountered a problem.
     var error: Error? { get }

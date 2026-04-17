@@ -33,7 +33,7 @@ final class MovieCapture: OutputService {
     // MARK: - Capturing a movie
     
     /// Starts movie recording.
-    func startRecording() {
+    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) {
         // Return early if already recording.
         guard !movieOutput.isRecording else { return }
         
@@ -50,12 +50,14 @@ final class MovieCapture: OutputService {
         if connection.isVideoStabilizationSupported {
             connection.preferredVideoStabilizationMode = .auto
         }
+
+        movieOutput.metadata = metadataItems(for: recordingStartMetadata)
         
         // Start a timer to update the recording time.
         startMonitoringDuration()
         
         delegate = MovieCaptureDelegate()
-        movieOutput.startRecording(to: URL.movieFileURL, recordingDelegate: delegate!)
+        movieOutput.startRecording(to: URL.localVideoRecordingFileURL, recordingDelegate: delegate!)
     }
     
     /// Stops movie recording.
@@ -79,13 +81,29 @@ final class MovieCapture: OutputService {
         var continuation: CheckedContinuation<Movie, Error>?
         
         func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-            if let error {
-                // If an error occurs, throw it to the caller.
-                continuation?.resume(throwing: error)
+            let isFinishedSuccessfully: Bool
+            if let nsError = error as NSError? {
+                let completionKey = AVErrorRecordingSuccessfullyFinishedKey
+                isFinishedSuccessfully = (nsError.userInfo[completionKey] as? Bool) ?? false
+                if !isFinishedSuccessfully {
+                    // Only fail when AVFoundation explicitly indicates the recording didn't finish.
+                    continuation?.resume(throwing: nsError)
+                    continuation = nil
+                    return
+                }
             } else {
-                // Return a new movie object.
-                continuation?.resume(returning: Movie(url: outputFileURL))
+                isFinishedSuccessfully = true
             }
+
+            guard isFinishedSuccessfully else {
+                continuation?.resume(throwing: CocoaError(.fileWriteUnknown))
+                continuation = nil
+                return
+            }
+
+            // Return a new movie object for successful finalization.
+            continuation?.resume(returning: Movie(url: outputFileURL))
+            continuation = nil
         }
     }
     
@@ -113,6 +131,32 @@ final class MovieCapture: OutputService {
     func updateConfiguration(for device: AVCaptureDevice) {
         // The app supports HDR video capture if the active format supports it.
         isHDRSupported = device.activeFormat10BitVariant != nil
+    }
+
+    private func metadataItems(for startMetadata: RecordingStartTimecodeMetadata?) -> [AVMetadataItem] {
+        guard let startMetadata else { return [] }
+
+        let source = makeMetadataItem(key: "com.kevin.avcam.timecode_source", value: startMetadata.source)
+        let timecode = makeMetadataItem(key: "com.kevin.avcam.start_timecode", value: startMetadata.timecode)
+        let fps = makeMetadataItem(key: "com.kevin.avcam.start_fps", value: "\(startMetadata.fps)")
+        let description = makeCommonDescriptionItem(value: "Start TC \(startMetadata.timecode) @ \(startMetadata.fps) fps")
+        return [source, timecode, fps, description]
+    }
+
+    private func makeMetadataItem(key: String, value: String) -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.keySpace = .quickTimeMetadata
+        item.key = key as NSString
+        item.value = value as NSString
+        return item
+    }
+
+    private func makeCommonDescriptionItem(value: String) -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.keySpace = .common
+        item.key = AVMetadataKey.commonKeyDescription as NSString
+        item.value = value as NSString
+        return item
     }
 
     // MARK: - Configuration

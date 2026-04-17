@@ -17,7 +17,7 @@ struct AVCamCaptureExtension: LockedCameraCaptureExtension {
     
     var body: some LockedCameraCaptureExtensionScene {
         LockedCameraCaptureUIScene { session in
-            CameraView(camera: camera)
+            CameraView(camera: camera, openLocalVideos: {})
                 .statusBarHidden(true)
                 .task {
                     // Start the capture pipeline.

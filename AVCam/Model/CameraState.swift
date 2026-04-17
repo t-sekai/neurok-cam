@@ -26,7 +26,7 @@ struct CameraState: Codable {
         didSet { save() }
     }
     
-    var captureMode = CaptureMode.photo {
+    var captureMode = CaptureMode.video {
         didSet { save() }
     }
     

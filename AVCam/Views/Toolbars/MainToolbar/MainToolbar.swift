@@ -6,7 +6,6 @@ A view that displays controls to capture, switch cameras, and view the last capt
 */
 
 import SwiftUI
-import PhotosUI
 
 /// A view that displays controls to capture, switch cameras, and view the last captured media item.
 struct MainToolbar<CameraModel: Camera>: PlatformView {
@@ -14,11 +13,12 @@ struct MainToolbar<CameraModel: Camera>: PlatformView {
     @Environment(\.verticalSizeClass) var verticalSizeClass
     @Environment(\.horizontalSizeClass) var horizontalSizeClass
     
-    @State var camera: CameraModel
+    let camera: CameraModel
+    let openLocalVideos: () -> Void
     
     var body: some View {
         HStack {
-			ThumbnailButton(camera: camera)
+			ThumbnailButton(camera: camera, openLocalVideos: openLocalVideos)
                 // Hide the thumbnail button when a person interacts with capture controls.
                 .opacity(camera.prefersMinimizedUI ? 0 : 1)
             Spacer()
@@ -40,6 +40,6 @@ struct MainToolbar<CameraModel: Camera>: PlatformView {
 
 #Preview {
     Group {
-        MainToolbar(camera: PreviewCameraModel())
+        MainToolbar(camera: PreviewCameraModel(), openLocalVideos: {})
     }
 }

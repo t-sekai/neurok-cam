@@ -7,11 +7,11 @@ A view that displays an appropriate capture button for the selected capture mode
 
 import SwiftUI
 
-/// A view that displays an appropriate capture button for the selected mode.
+/// A view that displays a movie capture button.
 @MainActor
 struct CaptureButton<CameraModel: Camera>: View {
     
-    @State var camera: CameraModel
+    let camera: CameraModel
     @State var isRecording = false
     
     private let mainButtonDimension: CGFloat = 68
@@ -31,62 +31,16 @@ struct CaptureButton<CameraModel: Camera>: View {
     
     @ViewBuilder
     var captureButton: some View {
-        switch camera.captureMode {
-        case .photo:
-            PhotoCaptureButton {
-                Task {
-                    await camera.capturePhoto()
-                }
-            }
-        case .video:
-            MovieCaptureButton(isRecording: $isRecording) { _ in
-                Task {
-                    await camera.toggleRecording()
-                }
+        MovieCaptureButton(isRecording: $isRecording) { _ in
+            Task {
+                await camera.toggleRecording()
             }
         }
     }
-}
-
-#Preview("Photo") {
-    CaptureButton(camera: PreviewCameraModel(captureMode: .photo))
 }
 
 #Preview("Video") {
-    CaptureButton(camera: PreviewCameraModel(captureMode: .video))
-}
-
-private struct PhotoCaptureButton: View {
-    private let action: () -> Void
-    private let lineWidth = CGFloat(4.0)
-    
-    init(action: @escaping () -> Void) {
-        self.action = action
-    }
-    
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(lineWidth: lineWidth)
-                .fill(.white)
-            Button {
-                action()
-            } label: {
-                Circle()
-                    .inset(by: lineWidth * 1.2)
-                    .fill(.white)
-            }
-            .buttonStyle(PhotoButtonStyle())
-        }
-    }
-    
-    struct PhotoButtonStyle: ButtonStyle {
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label
-                .scaleEffect(configuration.isPressed ? 0.85 : 1.0)
-                .animation(.easeInOut(duration: 0.15), value: configuration.isPressed)
-        }
-    }
+    CaptureButton(camera: PreviewCameraModel())
 }
 
 private struct MovieCaptureButton: View {

@@ -10,7 +10,7 @@ import SwiftUI
 /// A view that toggles the camera's capture mode.
 struct CaptureModeView<CameraModel: Camera>: View {
     
-    @State var camera: CameraModel
+    let camera: CameraModel
     @Binding private var direction: SwipeDirection
     
     init(camera: CameraModel, direction: Binding<SwipeDirection>) {
@@ -19,10 +19,13 @@ struct CaptureModeView<CameraModel: Camera>: View {
     }
     
     var body: some View {
-        Picker("Capture Mode", selection: $camera.captureMode) {
+        Picker("Capture Mode", selection: Binding(
+            get: { camera.captureMode },
+            set: { camera.captureMode = $0 }
+        )) {
             ForEach(CaptureMode.allCases) {
                 Image(systemName: $0.systemName)
-                    .tag($0.rawValue)
+                    .tag($0)
             }
         }
         .frame(width: 180)

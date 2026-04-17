@@ -13,25 +13,26 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
     @Environment(\.verticalSizeClass) var verticalSizeClass
     @Environment(\.horizontalSizeClass) var horizontalSizeClass
     
-    @State var camera: CameraModel
+    let camera: CameraModel
+    @State private var isShowingDirectorSettings = false
+    @State private var draftDirectorWebSocketURL = ""
+    @State private var draftDirectorDeviceName = ""
     
     var body: some View {
         HStack(spacing: 30) {
+            directorSettingsButton
             Spacer()
-            switch camera.captureMode {
-            case .photo:
-                livePhotoButton
-                prioritizePicker
-            case .video:
-                if camera.isHDRVideoSupported {
-                    hdrButton
-                }
+            if camera.isHDRVideoSupported {
+                hdrButton
             }
         }
         .buttonStyle(DefaultButtonStyle(size: isRegularSize ? .large : .small))
         .padding([.leading, .trailing])
         // Hide the toolbar items when a person interacts with capture controls.
         .opacity(camera.prefersMinimizedUI ? 0 : 1)
+        .sheet(isPresented: $isShowingDirectorSettings) {
+            directorSettingsSheet
+        }
     }
     
     //  A button to toggle the enabled state of Live Photo capture.
@@ -46,7 +47,10 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
     @ViewBuilder
     var prioritizePicker: some View {
         Menu {
-            Picker("Quality Prioritization", selection: $camera.qualityPrioritization) {
+            Picker("Quality Prioritization", selection: Binding(
+                get: { camera.qualityPrioritization },
+                set: { camera.qualityPrioritization = $0 }
+            )) {
                 ForEach(QualityPrioritization.allCases) {
                     Text($0.description)
                         .font(.body.weight(.bold))
@@ -90,6 +94,56 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
     var compactSpacer: some View {
         if !isRegularSize {
             Spacer()
+        }
+    }
+
+    var directorSettingsButton: some View {
+        Button {
+            draftDirectorWebSocketURL = camera.directorWebSocketURL
+            draftDirectorDeviceName = camera.directorDeviceName
+            isShowingDirectorSettings = true
+        } label: {
+            Image(systemName: "gearshape")
+        }
+        .accessibilityLabel("Remote Control Settings")
+    }
+
+    var directorSettingsSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Device") {
+                    TextField("Camera A", text: $draftDirectorDeviceName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text("Name shown in the laptop director.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Laptop Director") {
+                    TextField("ws://192.168.1.50:8765", text: $draftDirectorWebSocketURL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    Text("Leave blank to disable remote control.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Remote Control")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        isShowingDirectorSettings = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        camera.directorWebSocketURL = draftDirectorWebSocketURL
+                        camera.directorDeviceName = draftDirectorDeviceName
+                        isShowingDirectorSettings = false
+                    }
+                }
+            }
         }
     }
 }

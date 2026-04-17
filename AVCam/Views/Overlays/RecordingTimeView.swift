@@ -14,15 +14,31 @@ struct RecordingTimeView: PlatformView {
     @Environment(\.horizontalSizeClass) var horizontalSizeClass
     
     let time: TimeInterval
+    let tentacleTimecode: String
+    let recordingTimecode: String
     
     var body: some View {
-        Text(time.formatted)
+        Text(displayText)
             .padding([.leading, .trailing], 12)
             .padding([.top, .bottom], isRegularSize ? 8 : 0)
             .background(Color(white: 0.0, opacity: 0.5))
             .foregroundColor(.white)
             .font(.title2.weight(.semibold))
             .clipShape(.capsule)
+    }
+
+    private var displayText: String {
+        if !recordingTimecode.isEmpty {
+            return recordingTimecode
+        }
+        guard !tentacleTimecode.isEmpty else { return time.formatted }
+        return tentacleTimecodeWithoutFrames
+    }
+
+    private var tentacleTimecodeWithoutFrames: String {
+        let components = tentacleTimecode.split(separator: ":")
+        guard components.count == 4 else { return tentacleTimecode }
+        return components.prefix(3).joined(separator: ":")
     }
 }
 
@@ -38,6 +54,8 @@ extension TimeInterval {
 }
 
 #Preview {
-    RecordingTimeView(time: TimeInterval(floatLiteral: 500))
+    RecordingTimeView(time: TimeInterval(floatLiteral: 500),
+                      tentacleTimecode: "01:02:03",
+                      recordingTimecode: "")
         .background(Image("video_mode"))
 }
